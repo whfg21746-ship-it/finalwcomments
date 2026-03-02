@@ -32,6 +32,7 @@ class TelegramBot:
         token_filter: TokenFilter | None = None,
         token_pool: TokenPool | None = None,
         post_pool: Any = None,
+        comment_pool: Any = None,
         on_add_community: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_update_token: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         on_update_tokens_bulk: Callable[[list[str]], Coroutine[Any, Any, tuple[int, int]]] | None = None,
@@ -40,6 +41,7 @@ class TelegramBot:
         self._filter = token_filter
         self._pool = token_pool
         self._post_pool = post_pool
+        self._comment_pool = comment_pool
         self._on_add = on_add_community
         self._on_update_token = on_update_token
         self._on_update_tokens_bulk = on_update_tokens_bulk
@@ -292,7 +294,7 @@ class TelegramBot:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _main_menu_markup(post_pool: Any = None) -> dict:
+    def _main_menu_markup(post_pool: Any = None, comment_pool: Any = None) -> dict:
         """Build the main menu inline keyboard."""
         auto_post_label = "Auto-Post: ON" if (post_pool and post_pool.is_enabled()) else "Auto-Post: OFF"
         return {
@@ -308,6 +310,9 @@ class TelegramBot:
                 [
                     {"text": "Post Texts", "callback_data": "post_texts"},
                     {"text": "Post Images", "callback_data": "post_images"},
+                ],
+                [
+                    {"text": "Comment Boost", "callback_data": "comment_boost"},
                 ],
                 [
                     {"text": "Filters", "callback_data": "filters"},
@@ -333,6 +338,7 @@ class TelegramBot:
                 [{"text": "📊 Status"}, {"text": "📋 Tasks"}],
                 [{"text": "🔍 Scraper Tokens"}, {"text": "📝 Post Accounts"}],
                 [{"text": "✍️ Post Texts"}, {"text": "🖼 Post Images"}],
+                [{"text": "💬 Comment Boost"}],
                 [{"text": "⚙️ Filters"}, {"text": "📤 Export"}],
                 [{"text": auto_post_label}, {"text": pause_label}],
             ],
@@ -343,6 +349,23 @@ class TelegramBot:
     @staticmethod
     def _back_button() -> list[dict]:
         return [{"text": "Back to Menu", "callback_data": "menu"}]
+
+    def _comment_boost_menu_markup(self) -> dict:
+        """Build the Comment Boost inline menu."""
+        toggle_label = "Toggle OFF" if (self._comment_pool and self._comment_pool.is_enabled()) else "Toggle ON"
+        return {"inline_keyboard": [
+            [{"text": toggle_label, "callback_data": "cb:toggle"}],
+            [
+                {"text": "Comment Accounts", "callback_data": "cb:accounts"},
+                {"text": "Comment Texts", "callback_data": "cb:texts"},
+            ],
+            [
+                {"text": "Set Range", "callback_data": "cb:set_range"},
+                {"text": "Set Per Account", "callback_data": "cb:set_per_acc"},
+            ],
+            [{"text": "Set Proxy", "callback_data": "cb:set_proxy"}],
+            self._back_button(),
+        ]}
 
     # ------------------------------------------------------------------
     # Command handling (text commands — backward compatible)
@@ -709,6 +732,16 @@ class TelegramBot:
                 ],
                 self._back_button(),
             ]}
+            await self._send_with_markup(chat_id, msg, markup, session)
+            return True
+
+        if text == "💬 Comment Boost":
+            self._waiting_for.pop(chat_id, None)
+            if self._comment_pool:
+                msg = self._comment_pool.summary()
+            else:
+                msg = "Comment pool not configured."
+            markup = self._comment_boost_menu_markup()
             await self._send_with_markup(chat_id, msg, markup, session)
             return True
 
@@ -1181,6 +1214,174 @@ class TelegramBot:
                 session,
             )
 
+        # --- Comment Boost ---
+        elif cb_data == "comment_boost":
+            if self._comment_pool:
+                text = self._comment_pool.summary()
+            else:
+                text = "Comment pool not configured."
+            markup = self._comment_boost_menu_markup()
+            await self._edit_message(chat_id, message_id, text, markup, session)
+
+        elif cb_data == "cb:toggle":
+            if self._comment_pool:
+                new_val = self._comment_pool.toggle()
+                text = self._comment_pool.summary()
+                markup = self._comment_boost_menu_markup()
+                await self._edit_message(chat_id, message_id, text, markup, session)
+
+        elif cb_data == "cb:accounts":
+            if self._comment_pool:
+                text = self._comment_pool.accounts_summary()
+            else:
+                text = "Comment pool not configured."
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Add Account", "callback_data": "cb:acc_add"},
+                    {"text": "Upload .txt", "callback_data": "cb:acc_upload"},
+                ],
+                [
+                    {"text": "Clear Invalid", "callback_data": "cb:acc_clear_inv"},
+                    {"text": "Clear All", "callback_data": "cb:acc_clear_all"},
+                ],
+                [{"text": "Back", "callback_data": "comment_boost"}],
+            ]}
+            await self._edit_message(chat_id, message_id, text, markup, session)
+
+        elif cb_data == "cb:acc_add":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_account"}
+            await self._edit_message(
+                chat_id, message_id,
+                "Send me the auth_token for the comment account:",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:accounts"}]]},
+                session,
+            )
+
+        elif cb_data == "cb:acc_upload":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_account_file"}
+            await self._edit_message(
+                chat_id, message_id,
+                "Send me a .txt file with comment account tokens (one per line):",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:accounts"}]]},
+                session,
+            )
+
+        elif cb_data == "cb:acc_clear_inv":
+            if self._comment_pool:
+                removed = self._comment_pool.clear_invalid_accounts()
+                await self._edit_message(
+                    chat_id, message_id,
+                    f"Removed {removed} invalid comment account(s).",
+                    {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:accounts"}]]},
+                    session,
+                )
+
+        elif cb_data == "cb:acc_clear_all":
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Yes", "callback_data": "cb:acc_clear_confirm"},
+                    {"text": "No", "callback_data": "cb:accounts"},
+                ],
+            ]}
+            await self._edit_message(
+                chat_id, message_id,
+                "Are you sure you want to remove ALL comment accounts?",
+                markup, session,
+            )
+
+        elif cb_data == "cb:acc_clear_confirm":
+            if self._comment_pool:
+                count = self._comment_pool.clear_all_accounts()
+                await self._edit_message(
+                    chat_id, message_id,
+                    f"Removed all {count} comment account(s).",
+                    {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:accounts"}]]},
+                    session,
+                )
+
+        elif cb_data == "cb:texts":
+            if self._comment_pool:
+                texts_list = self._comment_pool.texts
+                if texts_list:
+                    lines = ["Comment Texts:\n"]
+                    for i, t in enumerate(texts_list):
+                        lines.append(f"{i + 1}. {t}")
+                    text = "\n".join(lines)
+                else:
+                    text = "No comment texts configured."
+            else:
+                text = "Comment pool not configured."
+            markup = {"inline_keyboard": [
+                [
+                    {"text": "Add Text", "callback_data": "cb:txt_add"},
+                    {"text": "Upload .txt", "callback_data": "cb:txt_upload"},
+                ],
+                [{"text": "Clear All", "callback_data": "cb:txt_clear_all"}],
+                [{"text": "Back", "callback_data": "comment_boost"}],
+            ]}
+            await self._edit_message(chat_id, message_id, text, markup, session)
+
+        elif cb_data == "cb:txt_add":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_text"}
+            await self._edit_message(
+                chat_id, message_id,
+                "Send me the comment text:",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:texts"}]]},
+                session,
+            )
+
+        elif cb_data == "cb:txt_upload":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_text_file"}
+            await self._edit_message(
+                chat_id, message_id,
+                "Send me a .txt file with comment texts (one per line):",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:texts"}]]},
+                session,
+            )
+
+        elif cb_data == "cb:txt_clear_all":
+            if self._comment_pool:
+                count = self._comment_pool.clear_texts()
+                await self._edit_message(
+                    chat_id, message_id,
+                    f"Removed all {count} comment text(s).",
+                    {"inline_keyboard": [[{"text": "Back", "callback_data": "cb:texts"}]]},
+                    session,
+                )
+
+        elif cb_data == "cb:set_range":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_range"}
+            current = self._comment_pool.total_range if self._comment_pool else [20, 40]
+            await self._edit_message(
+                chat_id, message_id,
+                f"Current range: {current[0]}-{current[1]}\n"
+                f"Send new range: min-max (e.g. 20-40 or 20 40)",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "comment_boost"}]]},
+                session,
+            )
+
+        elif cb_data == "cb:set_per_acc":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_per_acc"}
+            current = self._comment_pool.per_acc_comments if self._comment_pool else 3
+            await self._edit_message(
+                chat_id, message_id,
+                f"Current: {current} comments per account\n"
+                f"Send new number:",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "comment_boost"}]]},
+                session,
+            )
+
+        elif cb_data == "cb:set_proxy":
+            self._waiting_for[chat_id] = {"waiting_for": "comment_proxy"}
+            current = self._comment_pool.proxy if self._comment_pool else ""
+            await self._edit_message(
+                chat_id, message_id,
+                f"Current proxy: {current or '(none)'}\n"
+                f"Send proxy string (user:pass@host:port) or 'none' to clear:",
+                {"inline_keyboard": [[{"text": "Back", "callback_data": "comment_boost"}]]},
+                session,
+            )
+
         # --- Repost with different account ---
         elif cb_data.startswith("repost:"):
             await self._handle_repost(cb_data, chat_id, message_id, session)
@@ -1393,6 +1594,61 @@ class TelegramBot:
                     await self._send_plain(chat_id, "Expected: <min_minutes> <max_hours>", session)
             return True
 
+        elif waiting == "comment_account":
+            token_val = text.strip()
+            match = re.search(r'[a-fA-F0-9]{40}', token_val)
+            if match:
+                token_val = match.group(0)
+            if self._comment_pool:
+                is_new = self._comment_pool.add_account(token_val)
+                if is_new:
+                    await self._send_plain(chat_id, f"Comment account added: {token_val[:8]}...", session)
+                else:
+                    await self._send_plain(chat_id, f"Account already exists (reactivated if invalid): {token_val[:8]}...", session)
+            return True
+
+        elif waiting == "comment_text":
+            if self._comment_pool:
+                self._comment_pool.add_text(text.strip())
+                await self._send_plain(chat_id, "Comment text added.", session)
+            return True
+
+        elif waiting == "comment_range":
+            raw = text.strip().replace(",", " ").replace("-", " ")
+            parts = raw.split()
+            if len(parts) == 2:
+                try:
+                    min_val, max_val = int(parts[0]), int(parts[1])
+                    if min_val > max_val:
+                        min_val, max_val = max_val, min_val
+                    if self._comment_pool:
+                        self._comment_pool.set_total_range(min_val, max_val)
+                        await self._send_plain(chat_id, f"Comment range set: {min_val}-{max_val}", session)
+                except ValueError:
+                    await self._send_plain(chat_id, "Invalid numbers. Try: 20-40", session)
+            else:
+                await self._send_plain(chat_id, "Expected two numbers: min-max (e.g. 20-40)", session)
+            return True
+
+        elif waiting == "comment_per_acc":
+            try:
+                count = int(text.strip())
+                if self._comment_pool:
+                    self._comment_pool.set_per_acc(count)
+                    await self._send_plain(chat_id, f"Comments per account set: {count}", session)
+            except ValueError:
+                await self._send_plain(chat_id, "Invalid number.", session)
+            return True
+
+        elif waiting == "comment_proxy":
+            val = text.strip()
+            if val.lower() == "none":
+                val = ""
+            if self._comment_pool:
+                self._comment_pool.set_proxy(val)
+                await self._send_plain(chat_id, f"Comment proxy set: {val or '(cleared)'}", session)
+            return True
+
         elif waiting == "export_community_id":
             await self._cmd_export(chat_id, text.strip(), session)
             return True
@@ -1475,6 +1731,36 @@ class TelegramBot:
                     f"Loaded {new_count} new posting account(s) ({dup_count} duplicate(s)).",
                     session,
                 )
+            return
+
+        # Waiting for comment account file
+        if waiting == "comment_account_file":
+            self._waiting_for.pop(chat_id, None)
+            content = await self._download_file(file_id, session)
+            if content is None:
+                await self._send_plain(chat_id, "Failed to download file.", session)
+                return
+            if self._comment_pool:
+                new_count, dup_count = self._comment_pool.add_accounts_bulk(
+                    content.splitlines()
+                )
+                await self._send_plain(
+                    chat_id,
+                    f"Loaded {new_count} new comment account(s) ({dup_count} duplicate(s)).",
+                    session,
+                )
+            return
+
+        # Waiting for comment text file
+        if waiting == "comment_text_file":
+            self._waiting_for.pop(chat_id, None)
+            content = await self._download_file(file_id, session)
+            if content is None:
+                await self._send_plain(chat_id, "Failed to download file.", session)
+                return
+            if self._comment_pool:
+                count = self._comment_pool.add_texts_bulk(content.splitlines())
+                await self._send_plain(chat_id, f"Added {count} comment text(s).", session)
             return
 
         # Waiting for post text file
