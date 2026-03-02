@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import sys
 from datetime import datetime, timezone
@@ -26,6 +27,8 @@ from alerter.filters import TokenFilter
 from alerter.monitor import DexScreenerMonitor, TokenMemory, extract_community_id
 from bot.telegram_bot import TelegramBot
 from database.db import Database
+from commenter.pool import CommentPool
+from commenter.worker import run_comment_boost
 from poster.post_pool import PostPool
 from poster.worker import post_to_community
 from token_pool import TokenPool
@@ -75,6 +78,7 @@ _bot: TelegramBot | None = None
 _db: Database | None = None
 _pool: TokenPool | None = None
 _post_pool: PostPool | None = None
+_comment_pool: CommentPool | None = None
 _all_tokens_dead = False  # when True, scraper_loop sleeps until new token
 
 # Adaptive timeout: starts at 15 min, grows +5 on timeout, max 30, resets on success
@@ -170,6 +174,60 @@ async def on_new_task(
 
 
 # ---------------------------------------------------------------------------
+# Comment boost
+# ---------------------------------------------------------------------------
+
+
+async def _run_comment_boost(
+    tweet_id: str,
+    tweet_url: str,
+    token_name: str,
+    token_symbol: str,
+) -> None:
+    """Run comment boost in background after a successful post."""
+    try:
+        delay = random.randint(5, 15)
+        logger.info("Comment boost for %s: waiting %ds before start", token_symbol, delay)
+        await asyncio.sleep(delay)
+
+        pool = _comment_pool
+        bot = _bot
+        if pool is None or bot is None:
+            return
+
+        target_range = pool.total_range
+        accounts_count = pool.count_valid_accounts()
+
+        await bot.broadcast(
+            f"Comment boost started for ${token_symbol}\n"
+            f"Target: range {target_range[0]}-{target_range[1]}\n"
+            f"Accounts: {accounts_count} available"
+        )
+
+        result = await asyncio.to_thread(run_comment_boost, tweet_id, pool)
+
+        sent = result["sent"]
+        target = result["target"]
+        failed = result["failed"]
+        expired = result.get("expired_accounts", [])
+        expired_count = len(expired)
+
+        msg_parts = [
+            f"Comment boost completed for ${token_symbol}!",
+            f"Result: {sent}/{target} comments sent",
+        ]
+        if failed:
+            msg_parts.append(f"Failed: {failed}" + (f" ({expired_count} expired)" if expired_count else ""))
+        msg_parts.append(f"Tweet: {tweet_url}")
+        await bot.broadcast("\n".join(msg_parts))
+
+    except Exception as exc:
+        logger.error("Comment boost error (non-fatal): %s", exc, exc_info=True)
+        if _bot:
+            await _bot.broadcast(f"Comment boost error for ${token_symbol}: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Auto-posting
 # ---------------------------------------------------------------------------
 
@@ -220,6 +278,22 @@ async def run_auto_post(
                 ]]
             }
             await bot.broadcast_with_markup(msg, reply_markup)
+
+            # Launch comment boost if enabled
+            if (
+                _comment_pool is not None
+                and _comment_pool.is_enabled()
+                and _comment_pool.get_valid_accounts()
+                and _comment_pool.texts
+            ):
+                asyncio.create_task(
+                    _run_comment_boost(
+                        tweet_id=tweet_id,
+                        tweet_url=tweet_url,
+                        token_name=token_name,
+                        token_symbol=token_symbol,
+                    )
+                )
         else:
             error = result.get("error", "unknown error")
             msg = (
@@ -464,7 +538,7 @@ async def on_update_tokens_bulk(values: list[str]) -> tuple[int, int]:
 # ---------------------------------------------------------------------------
 
 async def main() -> None:
-    global _bot, _db, _pool, _post_pool
+    global _bot, _db, _pool, _post_pool, _comment_pool
 
     logger.info("=" * 60)
     logger.info("DexScreener + X Scraper + Auto-Poster Service starting")
@@ -480,6 +554,9 @@ async def main() -> None:
     post_pool = PostPool()
     _post_pool = post_pool
 
+    comment_pool = CommentPool()
+    _comment_pool = comment_pool
+
     token_filter = TokenFilter()
     memory = TokenMemory()
 
@@ -488,6 +565,7 @@ async def main() -> None:
         token_filter=token_filter,
         token_pool=pool,
         post_pool=post_pool,
+        comment_pool=comment_pool,
         on_add_community=on_add_community,
         on_update_token=on_update_token,
         on_update_tokens_bulk=on_update_tokens_bulk,
