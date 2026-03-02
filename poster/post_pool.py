@@ -25,6 +25,7 @@ _DEFAULT_CONFIG: dict[str, Any] = {
     "use_photo": True,
     "delay_after_alert_sec": 10,
     "enabled": True,
+    "max_posts_per_account": 5,
 }
 
 
@@ -36,6 +37,7 @@ class PostPool:
 
     def __init__(self) -> None:
         self._config: dict[str, Any] = dict(_DEFAULT_CONFIG)
+        self._post_counts: dict[int, int] = {}  # account_index -> successful post count
         _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         self._load()
 
@@ -178,6 +180,33 @@ class PostPool:
         if previews:
             parts.append("First 5: " + ", ".join(previews))
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Per-account post counter
+    # ------------------------------------------------------------------
+
+    @property
+    def max_posts_per_account(self) -> int:
+        return self._config.get("max_posts_per_account", 5)
+
+    def set_max_posts_per_account(self, value: int) -> None:
+        self._config["max_posts_per_account"] = value
+        self._save()
+
+    def record_post(self, account_index: int) -> None:
+        """Increment successful post counter for account. Auto-rotates if limit reached."""
+        self._post_counts[account_index] = self._post_counts.get(account_index, 0) + 1
+        logger.info(
+            "Account #%d post count: %d/%d",
+            account_index, self._post_counts[account_index], self.max_posts_per_account,
+        )
+        if self._post_counts[account_index] >= self.max_posts_per_account:
+            logger.info("Account #%d hit post limit (%d), rotating", account_index, self.max_posts_per_account)
+            self._post_counts[account_index] = 0
+            self.rotate_account()
+
+    def get_post_count(self, account_index: int) -> int:
+        return self._post_counts.get(account_index, 0)
 
     # ------------------------------------------------------------------
     # Tweet templates

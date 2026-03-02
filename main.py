@@ -232,6 +232,24 @@ async def _run_comment_boost(
 # ---------------------------------------------------------------------------
 
 
+async def _attempt_post(
+    community_id: str,
+    community_url: str,
+    token_name: str,
+    token_symbol: str,
+    post_pool: PostPool,
+) -> dict[str, Any]:
+    """Single post attempt. Returns result dict from post_to_community."""
+    return await asyncio.to_thread(
+        post_to_community,
+        community_id,
+        community_url,
+        token_name,
+        token_symbol,
+        post_pool,
+    )
+
+
 async def run_auto_post(
     community_id: str,
     community_url: str,
@@ -240,34 +258,77 @@ async def run_auto_post(
     post_pool: PostPool,
     bot: TelegramBot,
 ) -> None:
-    """Run auto-posting in background. ALL errors caught — never crashes main loop."""
+    """Run auto-posting in background with retry logic.
+
+    On failure: retry once with the same account.
+    If still fails: rotate to next account, try once more.
+    On success: record post (auto-rotates after max_posts_per_account).
+    """
     try:
         await asyncio.sleep(post_pool.delay)
-        result = await asyncio.to_thread(
-            post_to_community,
-            community_id,
-            community_url,
-            token_name,
-            token_symbol,
-            post_pool,
-        )
 
+        # --- Attempt 1: current account ---
+        result = await _attempt_post(
+            community_id, community_url, token_name, token_symbol, post_pool,
+        )
         account_index = result.get("account_index", -1)
+
+        if not result["success"]:
+            error1 = result.get("error", "unknown")
+            logger.warning(
+                "AUTO-POST attempt 1 failed (acc #%d): %s — retrying same account",
+                account_index, error1,
+            )
+
+            # --- Attempt 2: same account, retry ---
+            await asyncio.sleep(random.randint(3, 6))
+            result = await _attempt_post(
+                community_id, community_url, token_name, token_symbol, post_pool,
+            )
+            account_index = result.get("account_index", -1)
+
+            if not result["success"]:
+                error2 = result.get("error", "unknown")
+                logger.warning(
+                    "AUTO-POST attempt 2 failed (acc #%d): %s — rotating account",
+                    account_index, error2,
+                )
+
+                # --- Attempt 3: rotate to next account ---
+                new_token = post_pool.rotate_account()
+                if not new_token:
+                    await bot.broadcast(
+                        f"Failed to post in {token_name}: no valid accounts left after rotation"
+                    )
+                    return
+
+                await asyncio.sleep(random.randint(3, 6))
+                result = await _attempt_post(
+                    community_id, community_url, token_name, token_symbol, post_pool,
+                )
+                account_index = result.get("account_index", -1)
+
+        # --- Final result ---
         account = post_pool.get_current_account()
         token_preview = account["auth_token"][:8] if account else "???"
 
-        # Store repost context on the bot with a short UUID key (avoids 64-byte callback_data limit)
         repost_key = bot.store_repost_context(
             community_id, community_url, token_name, token_symbol
         )
 
         if result["success"]:
+            # Record successful post — auto-rotates after limit
+            post_pool.record_post(account_index)
+
             tweet_id = result["tweet_id"]
             tweet_url = result.get("tweet_url", "")
+            post_count = post_pool.get_post_count(account_index)
+            max_posts = post_pool.max_posts_per_account
             msg = (
                 f"Posted in {token_name} community!\n"
                 f"Link: {tweet_url}\n"
-                f"Account: #{account_index} ({token_preview}...)"
+                f"Account: #{account_index} ({token_preview}...) "
+                f"[{post_count}/{max_posts} posts]"
             )
             reply_markup = {
                 "inline_keyboard": [[
@@ -297,7 +358,7 @@ async def run_auto_post(
         else:
             error = result.get("error", "unknown error")
             msg = (
-                f"Failed to post in {token_name}: {error}\n"
+                f"Failed to post in {token_name} after 3 attempts: {error}\n"
                 f"Account: #{account_index} ({token_preview}...)"
             )
             reply_markup = {
