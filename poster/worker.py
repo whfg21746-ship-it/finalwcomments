@@ -22,9 +22,13 @@ _AUTH_ERROR_PATTERNS = [
     "user has been suspended",
     "forbidden",
     "unauthorized",
+    "authorizationerror",
+    "authorization:",
+    "permissions",
     "status 401",
     "status 403",
-    "this account is suspended",
+    "code': 440",
+    "code: 440",
 ]
 
 

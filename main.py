@@ -250,25 +250,6 @@ async def _attempt_post(
     )
 
 
-async def _handle_auth_error(
-    post_pool: PostPool, bot: TelegramBot, account_index: int, error: str,
-) -> bool:
-    """Mark account invalid on auth error, rotate, alert. Returns True if was auth error."""
-    accounts = post_pool._config.get("accounts", [])
-    if account_index < 0 or account_index >= len(accounts):
-        return False
-
-    token_preview = accounts[account_index]["auth_token"][:8]
-    post_pool.mark_invalid(account_index)
-    await bot.broadcast(
-        f"Post account #{account_index} ({token_preview}...) marked invalid: {error}"
-    )
-    next_token = post_pool.rotate_account()
-    if next_token is None:
-        await bot.broadcast("All post accounts exhausted! Add new accounts.")
-    return True
-
-
 async def run_auto_post(
     community_id: str,
     community_url: str,
@@ -277,157 +258,156 @@ async def run_auto_post(
     post_pool: PostPool,
     bot: TelegramBot,
 ) -> None:
-    """Run auto-posting in background with retry logic.
+    """Run auto-posting — loops through ALL valid accounts until success.
 
-    On auth error: immediately mark account invalid, rotate, alert.
-    On other failure: retry once with the same account, then rotate.
-    On success: record post; mark invalid + alert when use limit reached.
+    For each account: try up to 2 times.
+    If both fail → mark_invalid, alert, rotate to next account.
+    Repeats until a post succeeds or every account is exhausted.
     """
     try:
         await asyncio.sleep(post_pool.delay)
 
-        # --- Attempt 1: current account ---
-        result = await _attempt_post(
-            community_id, community_url, token_name, token_symbol, post_pool,
-        )
-        account_index = result.get("account_index", -1)
+        max_accounts_to_try = post_pool.count_valid_accounts()
+        if max_accounts_to_try == 0:
+            await bot.broadcast(
+                f"Cannot post in {token_name}: no valid posting accounts."
+            )
+            return
 
-        if not result["success"]:
-            error1 = result.get("error", "unknown")
+        result: dict | None = None
 
-            # Auth error — mark invalid immediately, don't retry same account
-            if result.get("auth_error"):
-                await _handle_auth_error(post_pool, bot, account_index, error1)
-                # Try once with the next valid account
-                if post_pool.has_accounts():
-                    await asyncio.sleep(random.randint(3, 6))
-                    result = await _attempt_post(
-                        community_id, community_url, token_name, token_symbol, post_pool,
-                    )
-                    account_index = result.get("account_index", -1)
-                    # If this one also has auth error
-                    if not result["success"] and result.get("auth_error"):
-                        await _handle_auth_error(post_pool, bot, account_index, result.get("error", "unknown"))
-                else:
-                    return
-            else:
-                logger.warning(
-                    "AUTO-POST attempt 1 failed (acc #%d): %s — retrying same account",
-                    account_index, error1,
-                )
+        for account_attempt in range(max_accounts_to_try):
+            account = post_pool.get_current_account()
+            if account is None:
+                break
 
-                # --- Attempt 2: same account, retry ---
-                await asyncio.sleep(random.randint(3, 6))
+            account_index = post_pool.get_current_index()
+            token_preview = account["auth_token"][:8]
+
+            # --- Try current account up to 2 times ---
+            for retry in range(2):
                 result = await _attempt_post(
                     community_id, community_url, token_name, token_symbol, post_pool,
                 )
-                account_index = result.get("account_index", -1)
+                account_index = result.get("account_index", account_index)
 
-                if not result["success"]:
-                    error2 = result.get("error", "unknown")
+                if result["success"]:
+                    break
 
-                    # Auth error on retry — mark invalid
-                    if result.get("auth_error"):
-                        await _handle_auth_error(post_pool, bot, account_index, error2)
-                    else:
-                        logger.warning(
-                            "AUTO-POST attempt 2 failed (acc #%d): %s — rotating account",
-                            account_index, error2,
-                        )
+                error = result.get("error", "unknown")
 
-                    # --- Attempt 3: rotate to next account ---
-                    new_token = post_pool.rotate_account()
-                    if not new_token:
-                        await bot.broadcast(
-                            f"Failed to post in {token_name}: no valid accounts left after rotation"
-                        )
-                        return
-
-                    await asyncio.sleep(random.randint(3, 6))
-                    result = await _attempt_post(
-                        community_id, community_url, token_name, token_symbol, post_pool,
+                # Auth error → don't retry same account, go straight to rotation
+                if result.get("auth_error"):
+                    logger.warning(
+                        "AUTO-POST auth error (acc #%d): %s — marking invalid",
+                        account_index, error,
                     )
-                    account_index = result.get("account_index", -1)
+                    break
 
-                    # Auth error on attempt 3 — mark invalid too
-                    if not result["success"] and result.get("auth_error"):
-                        await _handle_auth_error(post_pool, bot, account_index, result.get("error", "unknown"))
+                # First attempt non-auth error → retry once
+                if retry == 0:
+                    logger.warning(
+                        "AUTO-POST attempt 1 failed (acc #%d): %s — retrying",
+                        account_index, error,
+                    )
+                    await asyncio.sleep(random.randint(3, 6))
+
+            # Success — stop the loop
+            if result and result["success"]:
+                break
+
+            # Both attempts failed (or auth error) — mark invalid, alert, rotate
+            error = result.get("error", "unknown") if result else "unknown"
+            post_pool.mark_invalid(account_index)
+            await bot.broadcast(
+                f"Post account #{account_index} ({token_preview}...) "
+                f"marked invalid: {error}"
+            )
+
+            next_token = post_pool.rotate_account()
+            if next_token is None:
+                await bot.broadcast(
+                    f"All post accounts exhausted! "
+                    f"Failed to post in {token_name}. Add new accounts."
+                )
+                return
+
+            logger.info(
+                "Rotated to next account, attempt %d/%d",
+                account_attempt + 2, max_accounts_to_try,
+            )
+            await asyncio.sleep(random.randint(3, 6))
 
         # --- Final result ---
+        if result is None or not result["success"]:
+            repost_key = bot.store_repost_context(
+                community_id, community_url, token_name, token_symbol
+            )
+            await bot.broadcast_with_markup(
+                f"Failed to post in {token_name}: all accounts failed.",
+                {"inline_keyboard": [[
+                    {"text": "Retry", "callback_data": f"repost:{repost_key}"},
+                ]]},
+            )
+            return
+
+        # --- Success ---
+        account_index = result.get("account_index", -1)
         account = post_pool.get_current_account()
         token_preview = account["auth_token"][:8] if account else "???"
+
+        post_status = post_pool.record_post(account_index)
+
+        tweet_id = result["tweet_id"]
+        tweet_url = result.get("tweet_url", "")
+        post_count = post_pool.get_post_count(account_index)
+        max_posts = post_pool.max_posts_per_account
 
         repost_key = bot.store_repost_context(
             community_id, community_url, token_name, token_symbol
         )
+        msg = (
+            f"Posted in {token_name} community!\n"
+            f"Link: {tweet_url}\n"
+            f"Account: #{account_index} ({token_preview}...) "
+            f"[{post_count}/{max_posts} posts]"
+        )
+        await bot.broadcast_with_markup(
+            msg,
+            {"inline_keyboard": [[
+                {"text": "Repost with different account",
+                 "callback_data": f"repost:{repost_key}"},
+            ]]},
+        )
 
-        if result["success"]:
-            # Record successful post — marks invalid + rotates when limit reached
-            post_status = post_pool.record_post(account_index)
-
-            tweet_id = result["tweet_id"]
-            tweet_url = result.get("tweet_url", "")
-            post_count = post_pool.get_post_count(account_index)
-            max_posts = post_pool.max_posts_per_account
-            msg = (
-                f"Posted in {token_name} community!\n"
-                f"Link: {tweet_url}\n"
-                f"Account: #{account_index} ({token_preview}...) "
-                f"[{post_count}/{max_posts} posts]"
+        # Alert on use limit
+        if post_status == "limit_reached":
+            await bot.broadcast(
+                f"Post account #{account_index} ({token_preview}...) "
+                f"reached use limit ({max_posts}/{max_posts}), marked invalid"
             )
-            reply_markup = {
-                "inline_keyboard": [[
-                    {
-                        "text": "Repost with different account",
-                        "callback_data": f"repost:{repost_key}",
-                    }
-                ]]
-            }
-            await bot.broadcast_with_markup(msg, reply_markup)
-
-            # Alert on use limit
-            if post_status == "limit_reached":
-                await bot.broadcast(
-                    f"Post account #{account_index} ({token_preview}...) "
-                    f"reached use limit ({max_posts}/{max_posts}), marked invalid"
-                )
-            elif post_status == "exhausted":
-                await bot.broadcast(
-                    f"Post account #{account_index} ({token_preview}...) "
-                    f"reached use limit ({max_posts}/{max_posts}), marked invalid\n"
-                    f"All post accounts exhausted! Add new accounts."
-                )
-
-            # Launch comment boost if enabled
-            if (
-                _comment_pool is not None
-                and _comment_pool.is_enabled()
-                and _comment_pool.get_valid_accounts()
-                and _comment_pool.texts
-            ):
-                asyncio.create_task(
-                    _run_comment_boost(
-                        tweet_id=tweet_id,
-                        tweet_url=tweet_url,
-                        token_name=token_name,
-                        token_symbol=token_symbol,
-                    )
-                )
-        else:
-            error = result.get("error", "unknown error")
-            msg = (
-                f"Failed to post in {token_name} after 3 attempts: {error}\n"
-                f"Account: #{account_index} ({token_preview}...)"
+        elif post_status == "exhausted":
+            await bot.broadcast(
+                f"Post account #{account_index} ({token_preview}...) "
+                f"reached use limit ({max_posts}/{max_posts}), marked invalid\n"
+                f"All post accounts exhausted! Add new accounts."
             )
-            reply_markup = {
-                "inline_keyboard": [[
-                    {
-                        "text": "Retry with different account",
-                        "callback_data": f"repost:{repost_key}",
-                    }
-                ]]
-            }
-            await bot.broadcast_with_markup(msg, reply_markup)
+
+        # Launch comment boost if enabled
+        if (
+            _comment_pool is not None
+            and _comment_pool.is_enabled()
+            and _comment_pool.get_valid_accounts()
+            and _comment_pool.texts
+        ):
+            asyncio.create_task(
+                _run_comment_boost(
+                    tweet_id=tweet_id,
+                    tweet_url=tweet_url,
+                    token_name=token_name,
+                    token_symbol=token_symbol,
+                )
+            )
 
     except Exception as exc:
         logger.error("Auto-post error (non-fatal): %s", exc, exc_info=True)
