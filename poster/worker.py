@@ -14,6 +14,25 @@ from poster.x_api import XPoster
 
 logger = logging.getLogger(__name__)
 
+_AUTH_ERROR_PATTERNS = [
+    "failed to obtain ct0",
+    "could not authenticate you",
+    "suspended",
+    "account is suspended",
+    "user has been suspended",
+    "forbidden",
+    "unauthorized",
+    "status 401",
+    "status 403",
+    "this account is suspended",
+]
+
+
+def _is_auth_error(error: str) -> bool:
+    """Return True if the error string indicates an authentication/authorization problem."""
+    lower = error.lower()
+    return any(p in lower for p in _AUTH_ERROR_PATTERNS)
+
 
 def post_to_community(
     community_id: str,
@@ -33,6 +52,7 @@ def post_to_community(
             "tweet_id": None,
             "tweet_url": None,
             "error": "no valid posting accounts",
+            "auth_error": False,
             "account_index": -1,
         }
 
@@ -66,6 +86,7 @@ def post_to_community(
                 "tweet_id": None,
                 "tweet_url": None,
                 "error": "no tweet templates configured",
+                "auth_error": False,
                 "account_index": account_index,
             }
 
@@ -115,6 +136,7 @@ def post_to_community(
                 "tweet_id": tweet_id,
                 "tweet_url": tweet_url,
                 "error": None,
+                "auth_error": False,
                 "account_index": account_index,
             }
         else:
@@ -125,15 +147,18 @@ def post_to_community(
                 "tweet_id": None,
                 "tweet_url": None,
                 "error": f"no tweet_id in response: {error_msg}",
+                "auth_error": _is_auth_error(error_msg),
                 "account_index": account_index,
             }
 
     except Exception as exc:
+        error_str = str(exc)
         logger.error("post_to_community failed: %s", exc, exc_info=True)
         return {
             "success": False,
             "tweet_id": None,
             "tweet_url": None,
-            "error": str(exc),
+            "error": error_str,
+            "auth_error": _is_auth_error(error_str),
             "account_index": account_index,
         }

@@ -684,6 +684,9 @@ class TelegramBot:
                     {"text": "Clear Invalid", "callback_data": "post_accounts:clear_invalid"},
                     {"text": "Clear All", "callback_data": "post_accounts:clear_all"},
                 ],
+                [
+                    {"text": "Set Max Uses", "callback_data": "post_accounts:set_max_uses"},
+                ],
                 self._back_button(),
             ]}
             await self._send_with_markup(chat_id, summary, markup, session)
@@ -952,6 +955,9 @@ class TelegramBot:
                     {"text": "Clear Invalid", "callback_data": "post_accounts:clear_invalid"},
                     {"text": "Clear All", "callback_data": "post_accounts:clear_all"},
                 ],
+                [
+                    {"text": "Set Max Uses", "callback_data": "post_accounts:set_max_uses"},
+                ],
                 self._back_button(),
             ]}
             await self._edit_message(chat_id, message_id, text, markup, session)
@@ -1006,6 +1012,17 @@ class TelegramBot:
                     {"inline_keyboard": [self._back_button()]},
                     session,
                 )
+
+        elif cb_data == "post_accounts:set_max_uses":
+            current = self._post_pool.max_posts_per_account if self._post_pool else 5
+            self._waiting_for[chat_id] = {"waiting_for": "post_max_uses"}
+            await self._edit_message(
+                chat_id, message_id,
+                f"Current max uses per account: {current}\n"
+                f"Send a number to set new limit:",
+                {"inline_keyboard": [self._back_button()]},
+                session,
+            )
 
         # --- Post Texts ---
         elif cb_data == "post_texts":
@@ -1550,6 +1567,21 @@ class TelegramBot:
             if self._post_pool:
                 self._post_pool.add_tweet(text.strip())
                 await self._send_plain(chat_id, "Tweet template added.", session)
+            return True
+
+        elif waiting == "post_max_uses":
+            try:
+                value = int(text.strip())
+                if value < 1:
+                    raise ValueError
+            except ValueError:
+                await self._send_plain(chat_id, "Please send a positive integer.", session)
+                return True
+            if self._post_pool:
+                self._post_pool.set_max_posts_per_account(value)
+                await self._send_plain(
+                    chat_id, f"Max uses per account set to {value}.", session,
+                )
             return True
 
         elif waiting == "filter_mcap":

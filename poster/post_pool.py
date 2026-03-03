@@ -37,7 +37,6 @@ class PostPool:
 
     def __init__(self) -> None:
         self._config: dict[str, Any] = dict(_DEFAULT_CONFIG)
-        self._post_counts: dict[int, int] = {}  # account_index -> successful post count
         _IMAGES_DIR.mkdir(parents=True, exist_ok=True)
         self._load()
 
@@ -80,6 +79,7 @@ class PostPool:
         accounts.append({
             "auth_token": auth_token,
             "valid": True,
+            "use_count": 0,
             "added_at": datetime.now(timezone.utc).isoformat(),
         })
         self._save()
@@ -172,17 +172,19 @@ class PostPool:
         accounts = self._config.get("accounts", [])
         valid = sum(1 for a in accounts if a.get("valid", True))
         invalid = len(accounts) - valid
-        parts = [f"{valid} valid, {invalid} invalid, {len(accounts)} total."]
+        limit = self.max_posts_per_account
+        parts = [f"{valid} valid, {invalid} invalid, {len(accounts)} total. Max uses: {limit}"]
         previews = []
         for a in accounts[:5]:
             icon = "V" if a.get("valid", True) else "X"
-            previews.append(f"{a['auth_token'][:8]}...({icon})")
+            uses = a.get("use_count", 0)
+            previews.append(f"{a['auth_token'][:8]}...[{uses}/{limit}]({icon})")
         if previews:
             parts.append("First 5: " + ", ".join(previews))
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
-    # Per-account post counter
+    # Per-account post counter (persisted in account JSON as use_count)
     # ------------------------------------------------------------------
 
     @property
@@ -193,20 +195,39 @@ class PostPool:
         self._config["max_posts_per_account"] = value
         self._save()
 
-    def record_post(self, account_index: int) -> None:
-        """Increment successful post counter for account. Auto-rotates if limit reached."""
-        self._post_counts[account_index] = self._post_counts.get(account_index, 0) + 1
-        logger.info(
-            "Account #%d post count: %d/%d",
-            account_index, self._post_counts[account_index], self.max_posts_per_account,
-        )
-        if self._post_counts[account_index] >= self.max_posts_per_account:
-            logger.info("Account #%d hit post limit (%d), rotating", account_index, self.max_posts_per_account)
-            self._post_counts[account_index] = 0
-            self.rotate_account()
+    def record_post(self, account_index: int) -> str:
+        """Increment use_count for account. Returns status string.
+
+        Returns:
+            ``"ok"``            — counter incremented, account still valid.
+            ``"limit_reached"`` — account hit the limit, marked invalid, rotated.
+            ``"exhausted"``     — account hit limit AND no valid accounts left.
+        """
+        accounts = self._config.get("accounts", [])
+        if not (0 <= account_index < len(accounts)):
+            return "ok"
+
+        acc = accounts[account_index]
+        acc["use_count"] = acc.get("use_count", 0) + 1
+        self._save()
+
+        count = acc["use_count"]
+        limit = self.max_posts_per_account
+        logger.info("Account #%d post count: %d/%d", account_index, count, limit)
+
+        if count >= limit:
+            logger.info("Account #%d hit post limit (%d), marking invalid", account_index, limit)
+            self.mark_invalid(account_index)
+            next_token = self.rotate_account()
+            return "exhausted" if next_token is None else "limit_reached"
+
+        return "ok"
 
     def get_post_count(self, account_index: int) -> int:
-        return self._post_counts.get(account_index, 0)
+        accounts = self._config.get("accounts", [])
+        if 0 <= account_index < len(accounts):
+            return accounts[account_index].get("use_count", 0)
+        return 0
 
     # ------------------------------------------------------------------
     # Tweet templates
